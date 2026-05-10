@@ -1,0 +1,12 @@
+# IDE 配置文件
+.idea/
+__pycache__/
+
+# 超大模型文件（几GB，GitHub 不建议传）
+*.pth
+*.pt
+
+# 临时/缓存文件夹
+uploads/
+spotsdata/
+test/

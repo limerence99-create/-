@@ -1,0 +1,1310 @@
+import sys
+import torch
+from PIL import Image
+from PyQt5.QtWidgets import (
+    QApplication, QMainWindow, QVBoxLayout, QHBoxLayout,
+    QPushButton, QLabel, QWidget, QFileDialog, QMessageBox,
+    QLineEdit, QTextEdit, QScrollArea
+)
+from PyQt5.QtCore import Qt
+from PyQt5.QtGui import QPixmap, QFont, QColor, QIcon
+from torchvision import models, transforms
+import torch.nn as nn
+
+
+class SpotRecognitionModel(nn.Module):
+    def __init__(self, num_classes):
+        super().__init__()
+        self.resnet = models.resnet101(weights=None)
+        num_ftrs = self.resnet.fc.in_features
+        self.resnet.fc = nn.Sequential(
+            nn.Dropout(0.5),
+            nn.Linear(num_ftrs, 512),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.3),
+            nn.Linear(512, num_classes)
+        )
+
+    def forward(self, x):
+        return self.resnet(x)
+
+
+class SpotRecognitionApp(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.model = None
+        self.spot_labels = []
+        self.current_image_path = None
+        # 保存上传按钮实例，方便后续更新样式
+        self.upload_btn = None
+        # 保存重新上传按钮实例
+        self.reupload_btn = None
+        self.init_ui()
+        self.load_model()
+        self.load_spot_labels()
+
+    def init_ui(self):
+        self.setWindowTitle('广西景点识别系统')
+        self.setMinimumSize(1200, 700)
+        self.resize(1200, 700)
+
+        # 中央部件与主布局
+        central_widget = QWidget()
+        self.setCentralWidget(central_widget)
+        main_layout = QVBoxLayout(central_widget)
+        main_layout.setContentsMargins(20, 20, 20, 20)
+        main_layout.setSpacing(20)
+
+        # ========== 顶部状态栏 ==========
+        top_bar = QWidget()
+        top_layout = QHBoxLayout(top_bar)
+        top_layout.setContentsMargins(0, 0, 0, 0)
+        top_layout.setSpacing(10)
+
+        self.status_label = QLabel("识别结果 置信度: 0.0%")
+        self.status_label.setStyleSheet("font-size: 12px; color: #666;")
+        top_layout.addWidget(self.status_label)
+        top_layout.addStretch(1)
+        main_layout.addWidget(top_bar)
+
+        # ========== 中间内容区（左右分栏） ==========
+        content_widget = QWidget()
+        content_layout = QHBoxLayout(content_widget)
+        content_layout.setSpacing(20)
+
+        # ---------- 左侧图片上传/展示区 ----------
+        left_widget = QWidget()
+        left_layout = QVBoxLayout(left_widget)
+        left_layout.setSpacing(10)
+
+        # 图片标题
+        left_title = QLabel("您上传的图片")
+        left_title.setStyleSheet("font-size: 13px; font-weight: bold; color: #333;")
+        left_layout.addWidget(left_title)
+
+        # 图片展示容器
+        self.image_container = QWidget()
+        self.image_container.setStyleSheet("""
+            border: 1px solid #ddd;
+            padding: 10px;
+            background-color: #f9f9f9;
+        """)
+        image_layout = QVBoxLayout(self.image_container)
+        image_layout.setAlignment(Qt.AlignCenter)
+
+        # 图片显示标签
+        self.image_label = QLabel()
+        self.image_label.setAlignment(Qt.AlignCenter)
+        self.image_label.setStyleSheet("max-width: 500px; max-height: 300px;")
+        self.image_label.setText("请上传图片")
+        image_layout.addWidget(self.image_label)
+
+        # 图片操作按钮布局
+        button_layout = QHBoxLayout()
+        button_layout.setSpacing(10) # 按钮间距
+
+        # 上传按钮
+        self.upload_btn = QPushButton("🖼️ 上传图片")
+        self.upload_btn.setStyleSheet("""
+            QPushButton {
+                font-size: 12px;
+                color: #ff7600;
+                border: none;
+                background-color: transparent;
+                margin-top: 10px;
+            }
+            QPushButton:hover {
+                text-decoration: underline;
+                color: #e66400;
+            }
+        """)
+        self.upload_btn.clicked.connect(self.upload_image)
+        button_layout.addWidget(self.upload_btn, alignment=Qt.AlignCenter)
+
+        # 🔥 新增：重新上传按钮
+        self.reupload_btn = QPushButton("🔄 重新上传")
+        self.reupload_btn.setStyleSheet("""
+            QPushButton {
+                font-size: 12px;
+                color: #007BFF; /* 蓝色，区别于上传按钮 */
+                border: none;
+                background-color: transparent;
+                margin-top: 10px;
+            }
+            QPushButton:hover {
+                text-decoration: underline;
+                color: #0056b3; /* 深蓝色 */
+            }
+        """)
+        self.reupload_btn.clicked.connect(self.reupload_image)
+        # 初始时禁用
+        self.reupload_btn.setEnabled(False)
+        button_layout.addWidget(self.reupload_btn, alignment=Qt.AlignCenter)
+
+        # 将按钮布局添加到图片容器
+        image_layout.addLayout(button_layout)
+
+        left_layout.addWidget(self.image_container)
+        content_layout.addWidget(left_widget, stretch=1)
+
+        # ---------- 右侧信息展示区（滚动容器） ----------
+        right_scroll = QScrollArea()
+        right_scroll.setWidgetResizable(True)
+        right_scroll.setStyleSheet("border: none;")
+
+        right_widget = QWidget()
+        right_layout = QVBoxLayout(right_widget)
+        right_layout.setSpacing(15)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+
+        # 信息项：景区名称
+        self.spot_name = self.create_info_item("景区名称", "🔍")
+        right_layout.addWidget(self.spot_name)
+
+        # 信息项：详细地址
+        self.address = self.create_info_item("详细地址", "📍")
+        right_layout.addWidget(self.address)
+
+        # 信息项：景点介绍
+        self.intro = self.create_info_item("景点介绍", "📄", is_multiline=True)
+        right_layout.addWidget(self.intro)
+
+        # 信息项：门票信息
+        self.ticket = self.create_info_item("门票信息", "🎫")
+        right_layout.addWidget(self.ticket)
+
+        # 信息项：开放时间
+        self.open_time = self.create_info_item("开放时间", "⏰")
+        right_layout.addWidget(self.open_time)
+
+        # 信息项：特色景点
+        self.features = self.create_info_item("特色景点", "🌟", is_multiline=True)
+        right_layout.addWidget(self.features)
+
+        # 信息项：推荐游玩提示
+        self.tips = self.create_info_item("推荐游玩提示", "💡", is_multiline=True)
+        right_layout.addWidget(self.tips)
+
+        # 信息项：实用小贴士
+        self.advice = self.create_info_item("实用小贴士", "⚠️", is_multiline=True)
+        right_layout.addWidget(self.advice)
+
+        right_scroll.setWidget(right_widget)
+        content_layout.addWidget(right_scroll, stretch=1)
+        main_layout.addWidget(content_widget)
+
+        # ========== 底部操作区 ==========
+        bottom_bar = QWidget()
+        bottom_layout = QHBoxLayout(bottom_bar)
+        bottom_layout.setSpacing(20)
+
+        # 识别按钮
+        self.recognize_btn = QPushButton("识别景区")
+        self.recognize_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #ff7600;
+                color: white;
+                border-radius: 4px;
+                padding: 10px 30px;
+                font-size: 14px;
+                font-weight: bold;
+            }
+            QPushButton:disabled {
+                background-color: #ccc;
+            }
+        """)
+        self.recognize_btn.setEnabled(False)
+        self.recognize_btn.clicked.connect(self.recognize_spot)
+        bottom_layout.addWidget(self.recognize_btn)
+
+        # 示例图片按钮
+        example_label = QLabel("示例图片 (点击使用)")
+        example_label.setStyleSheet("font-size: 12px; color: #666;")
+        bottom_layout.addWidget(example_label)
+
+        example1_btn = QPushButton("示例1")
+        example2_btn = QPushButton("示例2")
+        for btn in [example1_btn, example2_btn]:
+            btn.setStyleSheet("""
+                QPushButton {
+                    border: 1px solid #ddd;
+                    border-radius: 3px;
+                    padding: 5px 10px;
+                    font-size: 12px;
+                }
+            """)
+        example1_btn.clicked.connect(lambda: self.load_example_image(1))
+        example2_btn.clicked.connect(lambda: self.load_example_image(2))
+        bottom_layout.addWidget(example1_btn)
+        bottom_layout.addWidget(example2_btn)
+
+        bottom_layout.addStretch(1)
+
+        # 功能按钮（分享/打印）
+        share_btn = QPushButton("分享结果")
+        print_btn = QPushButton("打印结果")
+        for btn in [share_btn, print_btn]:
+            btn.setStyleSheet("""
+                QPushButton {
+                    border: 1px solid #ddd;
+                    border-radius: 3px;
+                    padding: 5px 10px;
+                    font-size: 12px;
+                }
+            """)
+        bottom_layout.addWidget(share_btn)
+        bottom_layout.addWidget(print_btn)
+
+        main_layout.addWidget(bottom_bar)
+
+    def create_info_item(self, label_text, icon_text, is_multiline=False):
+        """创建参考页面样式的信息项（标签+内容）"""
+        item_widget = QWidget()
+        item_layout = QVBoxLayout(item_widget)
+        item_layout.setContentsMargins(0, 0, 0, 0)
+        item_layout.setSpacing(5)
+
+        # 标签行
+        label_bar = QWidget()
+        label_layout = QHBoxLayout(label_bar)
+        label_layout.setContentsMargins(0, 0, 0, 0)
+        label_layout.setSpacing(5)
+
+        icon_lbl = QLabel(icon_text)
+        icon_lbl.setStyleSheet("font-size: 14px;")
+        label_lbl = QLabel(label_text)
+        label_lbl.setStyleSheet("font-size: 13px; font-weight: bold; color: #333;")
+
+        label_layout.addWidget(icon_lbl)
+        label_layout.addWidget(label_lbl)
+        label_layout.addStretch(1)
+        item_layout.addWidget(label_bar)
+
+        # 内容控件
+        if is_multiline:
+            content_widget = QTextEdit()
+            content_widget.setStyleSheet("""
+                border: 1px solid #ddd;
+                padding: 8px;
+                font-size: 12px;
+                min-height: 60px;
+            """)
+        else:
+            content_widget = QLineEdit()
+            content_widget.setStyleSheet("""
+                border: 1px solid #ddd;
+                padding: 8px;
+                font-size: 12px;
+            """)
+        content_widget.setReadOnly(True)
+        item_layout.addWidget(content_widget)
+
+        # 存储内容控件（用于后续赋值）
+        setattr(self, f"{label_text.replace(' ', '_').lower()}_content", content_widget)
+        return item_widget
+
+    # ========== 上传图片功能（正常可用） ==========
+    def upload_image(self):
+        """修复后的上传图片功能，确保点击有效且界面反馈明显"""
+        # 1. 打开文件对话框，支持更多图片格式
+        file_name, file_type = QFileDialog.getOpenFileName(
+            self,
+            '选择广西景点图片',
+            '',
+            '图像文件 (*.jpg *.jpeg *.png *.bmp *.gif);;所有文件 (*.*)',
+            options=QFileDialog.DontUseNativeDialog  # 兼容不同系统
+        )
+
+        # 2. 判断文件是否有效（关键：避免空路径）
+        if not file_name or file_name.strip() == "":
+            QMessageBox.information(self, "提示", "未选择任何图片文件")
+            return
+
+        try:
+            # 3. 保存图片路径
+            self.current_image_path = file_name
+
+            # 4. 加载并显示图片（健壮的缩放逻辑）
+            pixmap = QPixmap(file_name)
+            if pixmap.isNull():  # 判断图片是否加载成功
+                QMessageBox.warning(self, "警告", "所选文件不是有效图片，请重新选择")
+                self.current_image_path = None
+                return
+
+            # 按比例缩放图片，适配显示区域
+            scaled_pixmap = pixmap.scaled(
+                self.image_label.maximumWidth(),
+                self.image_label.maximumHeight(),
+                Qt.KeepAspectRatio,
+                Qt.SmoothTransformation  # 平滑缩放，避免模糊
+            )
+            self.image_label.setPixmap(scaled_pixmap)
+            self.image_label.setText("")  # 清除默认提示文字
+            self.image_label.setAlignment(Qt.AlignCenter)
+
+            # 5. 明显的界面反馈（按钮文字+样式变化）
+            self.upload_btn.setText("✅ 图片已上传")
+            self.upload_btn.setStyleSheet("""
+                QPushButton {
+                    font-size: 12px;
+                    color: #2ecc71;
+                    border: none;
+                    background-color: transparent;
+                    margin-top: 10px;
+                    font-weight: bold;
+                }
+                QPushButton:hover {
+                    text-decoration: underline;
+                }
+            """)
+
+            # 6. 启用识别按钮（关键联动）
+            self.recognize_btn.setEnabled(True)
+
+            # 7. 启用重新上传按钮
+            self.reupload_btn.setEnabled(True)
+
+            # 8. 清空原有识别结果，避免混淆
+            self.clear_result()
+
+            # 9. 提示上传成功
+            QMessageBox.information(self, "成功", f"图片 {file_name.split('/')[-1].split('\\')[-1]} 上传成功！")
+
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"上传图片失败：{str(e)}")
+            self.current_image_path = None
+            self.recognize_btn.setEnabled(False)
+            self.reupload_btn.setEnabled(False) # 如果上传失败，也禁用重新上传
+
+    # ========== 🔥 新增：重新上传图片功能 ==========
+    def reupload_image(self):
+        """清空当前图片和结果，恢复到初始状态"""
+        # 1. 清空图片显示
+        self.image_label.clear() # 清空图片
+        self.image_label.setText("请上传图片") # 重置文字提示
+        self.image_label.setAlignment(Qt.AlignCenter)
+
+        # 2. 重置上传按钮状态
+        self.upload_btn.setText("🖼️ 上传图片")
+        self.upload_btn.setStyleSheet("""
+            QPushButton {
+                font-size: 12px;
+                color: #ff7600;
+                border: none;
+                background-color: transparent;
+                margin-top: 10px;
+            }
+            QPushButton:hover {
+                text-decoration: underline;
+                color: #e66400;
+            }
+        """)
+
+        # 3. 清空当前图片路径
+        self.current_image_path = None
+
+        # 4. 禁用识别按钮
+        self.recognize_btn.setEnabled(False)
+
+        # 5. 禁用自身（重新上传按钮）
+        self.reupload_btn.setEnabled(False)
+
+        # 6. 清空所有识别结果
+        self.clear_result()
+
+        # 7. 提示用户
+        QMessageBox.information(self, "提示", "已清空当前图片，可重新上传。")
+
+    # ========== 以下为原有功能代码，无修改 ==========
+    def load_model(self):
+        try:
+            checkpoint = torch.load('spot_recognition_resnet101.pth', map_location='cpu')
+            num_classes = checkpoint['num_classes']
+            self.model = models.resnet101(weights=None)
+            num_ftrs = self.model.fc.in_features
+            self.model.fc = nn.Sequential(
+                nn.Dropout(0.5),
+                nn.Linear(num_ftrs, 512),
+                nn.ReLU(inplace=True),
+                nn.Dropout(0.3),
+                nn.Linear(512, num_classes)
+            )
+            self.model.load_state_dict(checkpoint['model_state_dict'], strict=True)
+            self.model.eval()
+        except Exception as e:
+            QMessageBox.critical(self, '错误', f'模型加载失败: {str(e)}')
+
+    def load_spot_labels(self):
+        try:
+            with open('spot_labels.txt', 'r', encoding='utf-8') as f:
+                self.spot_labels = [line.strip() for line in f.readlines()]
+        except:
+            self.spot_labels = ['桂林山水', '阳朔西街', '漓江', '象鼻山', '龙脊梯田', '德天瀑布', '青秀山']
+
+    def recognize_spot(self):
+        if not self.current_image_path or not self.model:
+            QMessageBox.warning(self, '警告', '请先上传有效图片')
+            return
+
+        try:
+            preprocess = transforms.Compose([
+                transforms.Resize((224, 224)),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+            ])
+            image = Image.open(self.current_image_path).convert('RGB')
+            input_tensor = preprocess(image)
+            with torch.no_grad():
+                output = self.model(input_tensor.unsqueeze(0))
+            probs = torch.softmax(output[0], dim=0)
+            top_prob, top_idx = torch.topk(probs, 1)
+
+            if top_idx[0] < len(self.spot_labels):
+                spot_name = self.spot_labels[top_idx[0]]
+                self.status_label.setText(f"识别结果 {spot_name} 置信度: {top_prob.item() * 100:.1f}%")
+                spot_info = self.get_spot_info(spot_name)
+
+                # 填充信息到控件
+                self.景区名称_content.setText(spot_name)
+                self.详细地址_content.setText(spot_info['address'])
+                self.景点介绍_content.setText(spot_info['intro'])
+                self.门票信息_content.setText(spot_info['ticket'])
+                self.开放时间_content.setText(spot_info['open_time'])
+                self.特色景点_content.setText(spot_info['features'])
+                self.推荐游玩提示_content.setText(spot_info['tips'])
+                self.实用小贴士_content.setText(spot_info['advice'])
+            else:
+                QMessageBox.warning(self, '识别失败', '未识别到有效景点')
+        except Exception as e:
+            QMessageBox.critical(self, '错误', f'识别失败: {str(e)}')
+
+    def get_spot_info(self, spot_name):
+        spot_data = {
+            '三江鼓楼': {
+                'address': '广西柳州市三江侗族自治县古宜镇',
+                'intro': '三江鼓楼是侗族标志性建筑，高42.6米，共27层，被誉为“世界第一鼓楼”。',
+                'ticket': '免费开放（登楼可能收费约10元）',
+                'open_time': '08:30-17:30',
+                'features': '侗族木构技艺、鼓楼夜景、风雨桥、民族歌舞表演',
+                'tips': '建议傍晚前往欣赏灯光秀；可搭配程阳八寨一同游览。',
+                'advice': '注意尊重少数民族习俗；穿着舒适便于步行。'
+            },
+            '三街两巷历史文化街区': {
+                'address': '广西南宁市兴宁区解放路',
+                'intro': '南宁历史发源地，融合骑楼、古宅、老字号商铺，展现岭南文化风貌。',
+                'ticket': '免费开放',
+                'open_time': '全天开放',
+                'features': '金狮巷、银狮巷、邓颖超纪念馆、老南宁味道小吃街',
+                'tips': '夜晚灯光璀璨，适合拍照；周末常有民俗演出。',
+                'advice': '避开节假日高峰；品尝老友粉、酸嘢等本地小吃。'
+            },
+            '东门城楼': {
+                'address': '广西桂林市秀峰区中山中路',
+                'intro': '明代古城墙遗存，桂林现存最完整的城楼之一，登楼可俯瞰老城区。',
+                'ticket': '免费开放（登楼约5元）',
+                'open_time': '08:00-18:00',
+                'features': '古城墙、钟鼓楼、漓江风光、历史展览',
+                'tips': '清晨或黄昏光线最佳，适合摄影；可结合东西巷游览。',
+                'advice': '楼梯较陡，注意安全；带水和防晒用品。'
+            },
+            '中渡古镇': {
+                'address': '广西柳州市鹿寨县中渡镇',
+                'intro': '千年古镇，依山傍水，保留明清古建筑群，有“桂中第一古镇”之称。',
+                'ticket': '免费开放（部分景点另收费）',
+                'open_time': '08:00-17:30',
+                'features': '古码头、石板街、关帝庙、溶洞奇观、农家乐',
+                'tips': '适合自驾游，可体验划船、采摘、品农家菜。',
+                'advice': '雨季注意防滑；提前预订民宿。'
+            },
+            '云天文化城': {
+                'address': '广西玉林市玉州区江滨路',
+                'intro': '仿古宫殿式建筑群，集宗教、文化、艺术于一体，被誉为“南方小故宫”。',
+                'ticket': '成人票约60元，学生票半价',
+                'open_time': '08:30-17:30',
+                'features': '巨型佛像、壁画长廊、铜雕艺术、佛教文化展示',
+                'tips': '建议预留2小时参观；可顺道游览玉林园博园。',
+                'advice': '着装庄重；禁止喧哗、饮食。'
+            },
+            '亭子码头': {
+                'address': '广西南宁市江南区亭子大道',
+                'intro': '邕江畔新兴文旅地标，集休闲、餐饮、观景、夜游于一体。',
+                'ticket': '免费开放',
+                'open_time': '全天开放（夜游项目至22:00）',
+                'features': '江景步道、网红打卡点、游船码头、文创市集',
+                'tips': '夜晚乘船赏邕江夜景最佳；适合情侣约会、家庭散步。',
+                'advice': '注意防蚊虫；夜间照明充足但人多请看管好随身物品。'
+            },
+            '人民公园': {
+                'address': '广西南宁市兴宁区新民路',
+                'intro': '南宁市中心最大城市公园，历史悠久，绿树成荫，是市民休闲胜地。',
+                'ticket': '免费开放',
+                'open_time': '06:00-22:00',
+                'features': '九曲桥、湖心岛、儿童乐园、烈士纪念碑、健身广场',
+                'tips': '晨练、傍晚散步极佳；周末常有广场舞和戏曲表演。',
+                'advice': '注意垃圾分类；宠物需牵绳。'
+            },
+            '仙人山公园': {
+                'address': '广西贺州市八步区',
+                'intro': '以喀斯特地貌和丹霞景观著称，山顶可俯瞰贺州全景，空气清新。',
+                'ticket': '免费开放',
+                'open_time': '08:00-18:00',
+                'features': '登山步道、观景台、溶洞、野餐区、生态茶园',
+                'tips': '适合亲子徒步；春季杜鹃花开时最美。',
+                'advice': '穿运动鞋；自备饮用水和干粮。'
+            },
+            '会仙湿地': {
+                'address': '广西桂林市临桂区会仙镇',
+                'intro': '华南地区最大喀斯特湿地，水网密布，鹭鸟成群，被誉为“漓江之肾”。',
+                'ticket': '免费开放（部分游船收费）',
+                'open_time': '08:00-17:30',
+                'features': '水上田园、芦苇荡、观鸟平台、竹筏漂流',
+                'tips': '春秋季节观鸟最佳；可租自行车环湖骑行。',
+                'advice': '防蚊防晒；保护湿地环境，勿乱扔垃圾。'
+            },
+            '保德矮马王国': {
+                'address': '广西百色市德保县',
+                'intro': '以中国矮马文化为主题的主题乐园，适合亲子互动和动物科普。',
+                'ticket': '成人票约80元，儿童票50元',
+                'open_time': '09:00-17:30',
+                'features': '矮马骑行、萌宠乐园、亲子游乐设施、草原露营',
+                'tips': '周末人多建议早到；可体验喂养小动物。',
+                'advice': '注意孩子安全；园区内餐饮价格较高可自带零食。'
+            },
+            '全州天湖': {
+                'address': '广西桂林市全州县才湾镇',
+                'intro': '高山湖泊，海拔1200米以上，四季景色各异，夏季避暑胜地。',
+                'ticket': '免费开放（部分项目收费）',
+                'open_time': '08:00-18:00',
+                'features': '天湖水库、高山草甸、星空露营、徒步路线',
+                'tips': '冬季可赏雪景，夏季避暑；适合摄影爱好者。',
+                'advice': '山路崎岖，建议自驾SUV；早晚温差大需带外套。'
+            },
+            '八角寨景区': {
+                'address': '广西桂林市资源县与湖南新宁县交界处',
+                'intro': '国家地质公园，以丹霞地貌闻名，“鲸鱼闹海”奇观震撼人心。',
+                'ticket': '成人票约80元，学生票半价',
+                'open_time': '08:00-17:30',
+                'features': '一线天、龙头香、降龙庵、玻璃栈道、观景台',
+                'tips': '体力要求较高，建议穿防滑鞋；雨后云雾缭绕更壮观。',
+                'advice': '恐高者慎行玻璃栈道；提前购票避免排队。'
+            },
+            '凤山三门海景区': {
+                'address': '广西河池市凤山县',
+                'intro': '世界罕见的水下天窗群，可乘船穿越地下河，感受“水上桂林”。',
+                'ticket': '成人票约120元，学生票半价',
+                'open_time': '08:30-17:00',
+                'features': '三门海、天生桥、溶洞探险、水上栈道',
+                'tips': '建议全程乘船游览；夏季水位高更适合探秘。',
+                'advice': '穿救生衣；勿触碰钟乳石；保持安静保护生态环境。'
+            },
+            '勾漏洞风景区': {
+                'address': '广西玉林市北流市',
+                'intro': '道教名山，洞内石刻丰富，有“岭南第一洞天”之称。',
+                'ticket': '成人票约50元，学生票半价',
+                'open_time': '08:00-17:30',
+                'features': '溶洞群、摩崖石刻、炼丹遗址、道教文化馆',
+                'tips': '洞内湿滑，注意安全；可结合铜石岭景区一同游览。',
+                'advice': '带手电筒备用；洞内温度低需备薄外套。'
+            },
+            '北海金滩': {
+                'address': '广西北海市银海区侨港镇',
+                'intro': '北海三大海滩之一，沙质细腻，海水清澈，日落时分尤为浪漫。',
+                'ticket': '免费开放',
+                'open_time': '全天开放',
+                'features': '沙滩浴场、海上摩托艇、海鲜排档、日落观景台',
+                'tips': '傍晚看日落最佳；可体验赶海、挖螺、烧烤。',
+                'advice': '注意潮汐变化；防晒防蚊；选择正规海鲜摊位。'
+            },
+            '十万大山布透温泉': {
+                'address': '广西防城港市上思县',
+                'intro': '天然硫磺温泉，水质富含矿物质，对皮肤和关节有益。',
+                'ticket': '成人票约120元，住宿含温泉更划算',
+                'open_time': '09:00-22:00',
+                'features': '露天泡池、私汤房、SPA中心、森林氧吧',
+                'tips': '建议泡汤前先淋浴；饭后一小时再入池。',
+                'advice': '高血压、心脏病患者慎泡；携带泳衣毛巾。'
+            },
+            '千古情': {
+                'address': '广西桂林市阳朔县',
+                'intro': '大型实景演艺，融合壮族、瑶族、苗族文化，讲述广西历史传说。',
+                'ticket': '成人票约280元，VIP座加价',
+                'open_time': '演出时间通常为19:30-21:00（具体以官网为准）',
+                'features': '舞台特效、民族歌舞、互动体验、主题街区',
+                'tips': '提前购票选好座位；可搭配印象刘三姐观看。',
+                'advice': '剧场内禁止饮食；演出期间勿随意走动。'
+            },
+            '南丹歌娅思谷景区': {
+                'address': '广西河池市南丹县里湖乡',
+                'intro': '白裤瑶族文化体验地，展现原始部落生活、服饰、歌舞与婚俗。',
+                'ticket': '成人票约80元，学生票半价',
+                'open_time': '09:00-17:30',
+                'features': '民俗村寨、铜鼓表演、织布体验、长桌宴',
+                'tips': '参与互动节目需提前预约；可购买民族手工艺品。',
+                'advice': '尊重少数民族风俗；勿随意拍摄村民肖像。'
+            },
+            '南丹瑶望天下景区': {
+                'address': '广西河池市南丹县',
+                'intro': '瑶族文化主题景区，集观光、体验、康养、度假于一体。',
+                'ticket': '成人票约100元，含部分项目',
+                'open_time': '08:30-17:30',
+                'features': '瑶寨风情、梯田景观、非遗工坊、温泉养生',
+                'tips': '建议安排半天以上游览；可体验瑶药浴和长桌宴。',
+                'advice': '山区温差大，备厚衣物；注意防滑。'
+            },
+            '南宁孔庙': {
+                'address': '广西南宁市青秀区青环路',
+                'intro': '重建于2010年，背靠青秀山，面朝邕江，是南宁重要儒家文化地标。',
+                'ticket': '免费开放',
+                'open_time': '09:00-17:00',
+                'features': '大成殿、棂星门、泮池、碑林、祭孔仪式',
+                'tips': '春季祭孔大典期间人流量大；适合亲子研学。',
+                'advice': '着装得体；保持安静肃穆。'
+            },
+            '南宁方特东盟神画': {
+                'address': '广西南宁市青秀区青环路',
+                'intro': '以东盟十国文化为主题的高科技主题乐园，拥有多个沉浸式项目。',
+                'ticket': '成人票约280元，儿童/老人优惠',
+                'open_time': '10:00-18:00（节假日延长）',
+                'features': '飞越东盟、塔銮盛典、马六甲勇士、东南亚美食街',
+                'tips': '建议下载官方APP查看排队时间；热门项目上午优先体验。',
+                'advice': '园区较大，穿舒适鞋子；可自带水杯。'
+            },
+            '友谊关': {
+                'address': '广西崇左市凭祥市',
+                'intro': '中国九大名关之一，中越边境重要口岸，见证历史风云。',
+                'ticket': '成人票约50元，学生票半价',
+                'open_time': '08:30-17:30',
+                'features': '关楼、城墙、中越友谊馆、界碑、边贸市场',
+                'tips': '可办理边境一日游；建议上午前往避开人流高峰。',
+                'advice': '携带身份证件；遵守边境管理规定。'
+            },
+            '大圩古镇': {
+                'address': '广西桂林市灵川县',
+                'intro': '千年古镇，保存完好明清建筑，曾是漓江重要商埠。',
+                'ticket': '免费开放',
+                'open_time': '08:00-18:00',
+                'features': '青石板街、古码头、万寿桥、豆腐作坊、油茶店',
+                'tips': '适合慢游，品尝当地豆制品和油茶；可租电动车代步。',
+                'advice': '雨季路面湿滑；部分店铺下午关门较早。'
+            },
+            '大榕树': {
+                'address': '广西桂林市阳朔县',
+                'intro': '电影《刘三姐》取景地，树龄千年，枝繁叶茂，是阳朔地标。',
+                'ticket': '包含在漓江景区门票内，单独约20元',
+                'open_time': '08:00-18:00',
+                'features': '千年古树、祈福许愿、合影打卡、田园风光',
+                'tips': '清晨游客少，光线柔和；可搭配月亮山、聚龙潭游览。',
+                'advice': '勿攀爬古树；保护植被，勿乱丢垃圾。'
+            },
+            '天峨龙滩大峡谷国家森林公园': {
+                'address': '广西河池市天峨县',
+                'intro': '以峡谷、瀑布、原始森林为主，空气负离子含量极高。',
+                'ticket': '成人票约60元，学生票半价',
+                'open_time': '08:00-17:30',
+                'features': '龙滩大峡谷、红水河第一湾、悬索桥、徒步栈道',
+                'tips': '适合户外爱好者；雨季瀑布水量充沛更壮观。',
+                'advice': '穿防滑鞋；带驱蚊液；注意安全警示标识。'
+            },
+            '宁明花山岩画景区': {
+                'address': '广西崇左市宁明县',
+                'intro': '世界文化遗产，左江流域岩画群代表，记录古代骆越人祭祀场景。',
+                'ticket': '成人票约100元，含游船',
+                'open_time': '08:30-17:00',
+                'features': '岩画观景台、游船巡礼、文化展馆、民俗表演',
+                'tips': '乘船观赏岩画最佳；建议上午前往光线好。',
+                'advice': '勿触摸岩画；保护文物，禁止涂鸦。'
+            },
+            '宝鼎瀑布': {
+                'address': '广西桂林市临桂区',
+                'intro': '桂林市区近郊瀑布，落差70余米，气势磅礴，周边绿意盎然。',
+                'ticket': '免费开放',
+                'open_time': '08:00-18:00',
+                'features': '瀑布观景台、亲水步道、竹林小径、烧烤区',
+                'tips': '雨后水量最大，景色最壮观；适合亲子野餐。',
+                'advice': '湿滑路段注意安全；带防水相机或手机套。'
+            },
+            '容州民国小镇': {
+                'address': '广西玉林市容县',
+                'intro': '仿民国风格建筑群，还原民国时期街景，适合拍照与怀旧体验。',
+                'ticket': '免费开放（部分项目收费）',
+                'open_time': '09:00-21:00',
+                'features': '民国风店铺、旗袍体验、复古咖啡馆、街头表演',
+                'tips': '夜晚灯光效果更佳；可租借民国服装拍照。',
+                'advice': '注意保管贵重物品；部分区域台阶较多。'
+            },
+            '富川秀水状元村': {
+                'address': '广西贺州市富川瑶族自治县',
+                'intro': '千年古村落，出过27名进士，被誉为“状元村”，文化底蕴深厚。',
+                'ticket': '免费开放',
+                'open_time': '08:00-17:30',
+                'features': '古民居、牌坊、宗祠、状元桥、油菜花田',
+                'tips': '春季油菜花盛开时最美；可体验制作传统糕点。',
+                'advice': '村内道路狭窄，注意车辆通行；尊重村民生活习惯。'
+            },
+            '富里桥': {
+                'address': '广西桂林市阳朔县',
+                'intro': '遇龙河上的单拱石桥，造型优美，是摄影爱好者的天堂。',
+                'ticket': '免费开放',
+                'open_time': '全天开放',
+                'features': '古桥倒影、竹筏漂流、田园风光、写生基地',
+                'tips': '清晨或傍晚光线最佳；可结合遇龙河漂流一起游玩。',
+                'advice': '桥面较窄，注意安全；勿在桥上奔跑打闹。'
+            },
+            '左江斜塔': {
+                'address': '广西崇左市江州区',
+                'intro': '又称“歪塔”，建于明代，塔身倾斜却不倒，是建筑奇观。',
+                'ticket': '免费开放',
+                'open_time': '08:00-18:00',
+                'features': '斜塔外观、江景、历史解说牌、滨江步道',
+                'tips': '可与太平古城一同游览；适合拍创意照片。',
+                'advice': '塔内不开放登顶；注意江边安全。'
+            },
+            '巴马水晶宫景区': {
+                'address': '广西河池市巴马瑶族自治县',
+                'intro': '喀斯特溶洞奇观，内部钟乳石晶莹剔透，宛如水晶宫殿。',
+                'ticket': '成人票约120元，学生票半价',
+                'open_time': '08:30-17:00',
+                'features': '水晶柱、地下河、灯光秀、长寿文化展',
+                'tips': '洞内恒温18℃，建议穿外套；可结合百魔洞游览。',
+                'advice': '勿触碰钟乳石；保持安静，保护生态环境。'
+            },
+            '布尼梯田': {
+                'address': '广西南宁市马山县',
+                'intro': '壮族梯田景观，层层叠叠，春灌秋收时节尤为壮观。',
+                'ticket': '免费开放',
+                'open_time': '08:00-18:00',
+                'features': '梯田观景台、农耕体验、民俗表演、星空摄影',
+                'tips': '4-5月灌水期、9-10月收割期最美；建议清晨前往。',
+                'advice': '山路崎岖，建议自驾或包车；带防滑鞋。'
+            },
+            '广西吾园': {
+                'address': '广西南宁市青秀区',
+                'intro': '现代园林艺术空间，融合中式庭院与当代设计，适合静心休憩。',
+                'ticket': '免费开放',
+                'open_time': '09:00-18:00',
+                'features': '假山流水、茶室、书画展厅、禅意空间',
+                'tips': '适合午后品茶冥想；可参加定期文化讲座。',
+                'advice': '保持安静；禁止喧哗、饮食（除指定区域）。'
+            },
+            '广西文化艺术中心': {
+                'address': '广西南宁市良庆区',
+                'intro': '现代化多功能艺术场馆，涵盖歌剧、话剧、音乐会等多种演出。',
+                'ticket': '按演出票价（约80-800元不等）',
+                'open_time': '演出时间依节目而定，通常19:30开场',
+                'features': '大剧院、音乐厅、小剧场、艺术展览、文创商店',
+                'tips': '提前购票选座；建议提前30分钟入场。',
+                'advice': '着装整洁；演出期间勿使用手机闪光灯。'
+            },
+            '德天瀑布': {
+                'address': '广西崇左市大新县硕龙镇',
+                'intro': '亚洲第一、世界第四大跨国瀑布，与越南板约瀑布相连。',
+                'ticket': '成人票约80元，学生票半价，游船另计',
+                'open_time': '08:00-18:00',
+                'features': '跨国瀑布、竹筏漂流、观景台、跨境集市',
+                'tips': '雨季水量最大，景色最壮观；建议上午前往避开人流。',
+                'advice': '穿防滑鞋；注意边境安全；勿越界。'
+            },
+            '扬美古镇': {
+                'address': '广西南宁市江南区江西镇',
+                'intro': '明清古建筑保存完好，青砖灰瓦，古韵悠长，是南宁“小周庄”。',
+                'ticket': '免费开放',
+                'open_time': '08:00-18:00',
+                'features': '古码头、老街巷、宗祠、豆豉作坊、江景',
+                'tips': '适合周末短途游；可体验制作豆豉、品尝江鲜。',
+                'advice': '部分路段坑洼，注意行走安全；尊重当地居民。'
+            },
+            '日月双塔': {
+                'address': '广西桂林市象山区杉湖',
+                'intro': '桂林地标性建筑，日塔为铜塔，月塔为琉璃塔，夜景璀璨。',
+                'ticket': '登塔约50元，外围免费',
+                'open_time': '08:00-22:00',
+                'features': '双塔夜景、湖光倒影、电梯登顶、文化展览',
+                'tips': '夜晚灯光秀最美；可结合两江四湖游船游览。',
+                'advice': '塔内楼梯较陡，注意安全；登塔前可先拍照留念。'
+            },
+            '木龙湖景区': {
+                'address': '广西桂林市叠彩区',
+                'intro': '以宋代风格建筑为主，融合山水园林，是两江四湖核心景区之一。',
+                'ticket': '包含在两江四湖游船票内，单独约60元',
+                'open_time': '08:00-22:00',
+                'features': '宋城、木龙塔、诗词碑林、夜景灯光秀',
+                'tips': '建议傍晚乘船游览，夜景更美；可搭配日月双塔一同游览。',
+                'advice': '景区内餐饮价格较高，可自带水和零食。'
+            },
+            '柳州动物园': {
+                'address': '广西柳州市鱼峰区',
+                'intro': '综合性动物园，拥有大熊猫、长颈鹿、白虎等珍稀动物。',
+                'ticket': '成人票约50元，儿童票半价',
+                'open_time': '08:30-17:30',
+                'features': '动物展区、儿童游乐区、科普馆、萌宠互动',
+                'tips': '周末人多建议早到；可参与投喂活动（另收费）。',
+                'advice': '勿随意投喂动物；注意孩子安全。'
+            },
+            '柳州博物馆': {
+                'address': '广西柳州市城中区解放北路',
+                'intro': '展示柳州历史、民族、工业、文化发展的综合性博物馆。',
+                'ticket': '免费开放',
+                'open_time': '09:00-17:00（周一闭馆）',
+                'features': '青铜器、贝丘遗址、工业发展史、民族服饰展',
+                'tips': '建议预留2小时参观；可租用语音导览设备。',
+                'advice': '保持安静；禁止饮食、触摸展品。'
+            },
+            '柳州奇石馆': {
+                'address': '广西柳州市鱼峰区',
+                'intro': '国内最大奇石主题展馆，收藏各类奇石数万件，形态各异。',
+                'ticket': '成人票约30元，学生票半价',
+                'open_time': '09:00-17:00',
+                'features': '奇石展区、科普讲解、DIY体验、文创商店',
+                'tips': '适合亲子研学；可购买小型奇石作为纪念品。',
+                'advice': '勿触摸展品；馆内光线较暗，注意脚下。'
+            },
+            '柳州工业博物馆': {
+                'address': '广西柳州市鱼峰区文昌路',
+                'intro': '记录柳州工业发展历程，展示汽车、机械、钢铁等产业成就。',
+                'ticket': '免费开放',
+                'open_time': '09:00-17:00（周一闭馆）',
+                'features': '老厂房改造、工业设备、互动体验、影像资料',
+                'tips': '适合对工业感兴趣的游客；可结合柳州螺蛳粉文化体验。',
+                'advice': '馆内空间较大，穿舒适鞋子；禁止吸烟。'
+            },
+            '桂林博物馆': {
+                'address': '广西桂林市秀峰区西山路',
+                'intro': '桂林历史文化的集中展示地，藏品丰富，涵盖陶瓷、书画、民俗。',
+                'ticket': '免费开放',
+                'open_time': '09:00-17:00（周一闭馆）',
+                'features': '出土文物、桂林山水画、少数民族服饰、临时展览',
+                'tips': '建议预留1.5小时参观；可结合象鼻山景区游览。',
+                'advice': '保持安静；禁止饮食、拍照闪光灯。'
+            },
+            '桂海晴岚': {
+                'address': '广西桂林市雁山区',
+                'intro': '高端文旅综合体，融合艺术、自然、休闲，是新晋网红打卡地。',
+                'ticket': '免费开放（部分项目收费）',
+                'open_time': '09:00-21:00',
+                'features': '艺术装置、草坪露营、咖啡厅、湖景步道、夜景灯光',
+                'tips': '适合拍照、野餐、放风筝；晚上灯光秀值得一看。',
+                'advice': '园区较大，建议穿舒适鞋；部分区域需预约。'
+            },
+            '榕湖': {
+                'address': '广西桂林市秀峰区',
+                'intro': '桂林市区内著名湖泊，湖中有古榕树，周边有名人故居和雕塑。',
+                'ticket': '免费开放',
+                'open_time': '全天开放',
+                'features': '古榕树、湖心亭、音乐喷泉、环湖步道、夜景灯光',
+                'tips': '夜晚喷泉表演时间约19:30、20:30；适合散步、拍照。',
+                'advice': '注意湖边安全；勿投喂鱼类。'
+            },
+            '武宣百崖大峡谷': {
+                'address': '广西来宾市武宣县',
+                'intro': '喀斯特峡谷地貌，溪流潺潺，瀑布飞溅，是户外探险好去处。',
+                'ticket': '成人票约60元，学生票半价',
+                'open_time': '08:00-17:30',
+                'features': '峡谷栈道、瀑布群、溯溪探险、观景台',
+                'tips': '建议穿防滑鞋；雨季水量大，景色更壮观。',
+                'advice': '注意安全警示；勿独自深入未开发区域。'
+            },
+            '江宇梦想小镇': {
+                'address': '广西南宁市江南区',
+                'intro': '集科技、文化、休闲于一体的现代特色小镇，适合亲子和年轻人。',
+                'ticket': '免费开放（部分项目收费）',
+                'open_time': '09:00-21:00',
+                'features': 'VR体验、电竞馆、文创市集、美食街、亲子乐园',
+                'tips': '周末人多建议错峰；可体验沉浸式游戏项目。',
+                'advice': '注意电子设备使用安全；园区内餐饮价格适中。'
+            },
+            '河池小三峡景区': {
+                'address': '广西河池市金城江区',
+                'intro': '由三段峡谷组成，碧水青山，风景秀丽，有“桂西小三峡”之称。',
+                'ticket': '成人票约80元，学生票半价',
+                'open_time': '08:30-17:00',
+                'features': '峡谷漂流、观景台、溶洞、民族歌舞表演',
+                'tips': '建议乘船游览；夏季水位高更适合漂流。',
+                'advice': '穿救生衣；注意防晒防蚊；保护生态环境。'
+            },
+            '浩坤湖': {
+                'address': '广西百色市凌云县',
+                'intro': '高山平湖，湖水清澈，四周群山环绕，是摄影和露营胜地。',
+                'ticket': '免费开放（部分项目收费）',
+                'open_time': '08:00-18:00',
+                'features': '环湖公路、观景台、渔家乐、星空露营、皮划艇',
+                'tips': '清晨或傍晚光线最佳；可体验湖边烧烤、垂钓。',
+                'advice': '山路弯多，注意驾驶安全；带防寒衣物。'
+            },
+            '海丝首港景区': {
+                'address': '广西北海市合浦县',
+                'intro': '重现汉代海上丝绸之路始发港风貌，融合历史、文化、旅游。',
+                'ticket': '成人票约120元，学生票半价',
+                'open_time': '09:00-18:00',
+                'features': '仿古港口、丝路文化馆、沉浸式演出、美食街',
+                'tips': '建议预留半天游览；可体验汉服拍照、手工制作。',
+                'advice': '注意防晒；园区内餐饮价格较高可自带水。'
+            },
+            '海洋之窗': {
+                'address': '广西北海市海城区',
+                'intro': '大型海洋馆，展示珊瑚礁、热带鱼、海豚、海龟等海洋生物。',
+                'ticket': '成人票约150元，儿童票半价',
+                'open_time': '09:00-17:30',
+                'features': '海底隧道、海豚表演、水母馆、科普互动',
+                'tips': '海豚表演时间约11:00、15:00；建议提前购票。',
+                'advice': '勿拍打玻璃；注意孩子安全；馆内温度较低。'
+            },
+            '海洋乡银杏林': {
+                'address': '广西桂林市灵川县',
+                'intro': '中国最美银杏之乡，每到深秋，满地金黄，宛如童话世界。',
+                'ticket': '免费开放（部分村落收费约10-20元）',
+                'open_time': '全天开放',
+                'features': '银杏大道、古村落、摄影基地、农家乐',
+                'tips': '11月中下旬为最佳观赏期；建议清晨前往避开人流。',
+                'advice': '穿防滑鞋；勿攀折树枝；保护环境勿乱扔垃圾。'
+            },
+            '渠洋湖': {
+                'address': '广西百色市靖西市',
+                'intro': '高原湖泊，湖中有众多小岛，山水相映，是“小桂林”。',
+                'ticket': '免费开放（游船另计）',
+                'open_time': '08:00-18:00',
+                'features': '湖光山色、游船观光、渔家乐、观景台',
+                'tips': '建议乘船游览；可结合通灵大峡谷一同游玩。',
+                'advice': '注意防晒；湖边湿滑，注意安全。'
+            },
+            '灵渠': {
+                'address': '广西桂林市兴安县',
+                'intro': '世界最古老运河之一，秦代修建，沟通湘江与漓江，历史意义重大。',
+                'ticket': '成人票约60元，学生票半价',
+                'open_time': '08:00-17:30',
+                'features': '古运河、铧嘴、大小天平、文化展馆、游船',
+                'tips': '建议乘船游览；可结合猫儿山景区一同游览。',
+                'advice': '注意保护文物；勿在河道内游泳。'
+            },
+            '玉石林景区': {
+                'address': '广西贺州市八步区',
+                'intro': '典型的喀斯特地貌，石峰林立，形态奇特，被誉为“玉石森林”。',
+                'ticket': '成人票约60元，学生票半价',
+                'open_time': '08:00-17:30',
+                'features': '迷宫石林、观景台、玻璃栈道、科普解说',
+                'tips': '建议穿防滑鞋；雨后石林更显湿润幽深。',
+                'advice': '注意安全警示；勿攀爬未开放区域。'
+            },
+            '白莲洞洞穴科学博物馆': {
+                'address': '广西柳州市鱼峰区',
+                'intro': '集洞穴科学、考古、旅游于一体的专题博物馆，展示人类进化历程。',
+                'ticket': '免费开放',
+                'open_time': '09:00-17:00（周一闭馆）',
+                'features': '洞穴遗址、化石展、模拟考古、科普互动',
+                'tips': '适合亲子研学；可结合柳州动物园游览。',
+                'advice': '保持安静；禁止饮食、触摸展品。'
+            },
+            '百朋荷苑（下伦荷花景区)': {
+                'address': '广西柳州市柳江区',
+                'intro': '万亩荷花盛开，清香扑鼻，是赏荷、摄影、休闲的好地方。',
+                'ticket': '免费开放（部分项目收费）',
+                'open_time': '08:00-18:00',
+                'features': '荷花观赏、栈道漫步、摄影基地、农家乐',
+                'tips': '6-7月为盛花期；建议清晨或傍晚前往光线柔和。',
+                'advice': '注意防蚊虫；勿采摘荷花；保护生态环境。'
+            },
+            '百色起义纪念园': {
+                'address': '广西百色市右江区',
+                'intro': '纪念邓小平领导百色起义的历史圣地，红色旅游重要景点。',
+                'ticket': '免费开放',
+                'open_time': '09:00-17:00',
+                'features': '纪念馆、起义纪念碑、红军桥、雕塑群、党史展',
+                'tips': '适合团队研学；可结合右江革命根据地旧址游览。',
+                'advice': '着装庄重；保持肃穆；禁止喧哗。'
+            },
+            '百里柳江旅游景区': {
+                'address': '广西柳州市区沿江两岸',
+                'intro': '以柳江为轴线的滨江风光带，集休闲、娱乐、文化于一体。',
+                'ticket': '免费开放',
+                'open_time': '全天开放',
+                'features': '滨江步道、音乐喷泉、桥梁夜景、游船码头、文化广场',
+                'tips': '夜晚灯光秀最美；可乘船夜游柳江。',
+                'advice': '注意江边安全；勿乱扔垃圾。'
+            },
+            '相公山': {
+                'address': '广西桂林市阳朔县',
+                'intro': '漓江第一湾观景台，登顶可俯瞰漓江蜿蜒如带，景色绝美。',
+                'ticket': '成人票约60元，学生票半价',
+                'open_time': '06:00-18:00',
+                'features': '观景台、漓江风光、日出日落、摄影基地',
+                'tips': '清晨看日出最佳；建议提前到达占好位置。',
+                'advice': '山路陡峭，注意安全；带防滑鞋和外套。'
+            },
+            '相思小镇': {
+                'address': '广西南宁市西乡塘区',
+                'intro': '仿古建筑群，融合江南水乡与岭南风格，适合拍照与休闲。',
+                'ticket': '免费开放',
+                'open_time': '09:00-21:00',
+                'features': '小桥流水、古街巷、茶馆、文创店、夜景灯光',
+                'tips': '夜晚灯光效果更佳；可租借汉服拍照。',
+                'advice': '注意地面湿滑；部分区域需预约。'
+            },
+            '穿山公园': {
+                'address': '广西桂林市七星区',
+                'intro': '以穿山岩和塔山闻名，是桂林市区内重要自然与人文景观结合地。',
+                'ticket': '免费开放',
+                'open_time': '06:00-22:00',
+                'features': '穿山岩、塔山、湖景、儿童乐园、健身广场',
+                'tips': '适合晨练和傍晚散步；可登塔山俯瞰市区。',
+                'advice': '注意安全；勿攀爬未开放区域。'
+            },
+            '罗城棉花天坑度假区': {
+                'address': '广西河池市罗城县',
+                'intro': '喀斯特天坑地貌，深度超百米，集观光、探险、度假于一体。',
+                'ticket': '成人票约120元，学生票半价',
+                'open_time': '08:30-17:30',
+                'features': '天坑观景台、玻璃栈道、悬崖酒店、溶洞探险',
+                'tips': '建议预留半天游览；可体验高空滑索、攀岩。',
+                'advice': '恐高者慎行；注意安全警示；带防滑鞋。'
+            },
+            '苍梧县六堡茶生态旅游景区': {
+                'address': '广西梧州市苍梧县六堡镇',
+                'intro': '六堡茶原产地，可体验采茶、制茶、品茶全过程。',
+                'ticket': '免费开放（部分体验项目收费）',
+                'open_time': '08:30-17:30',
+                'features': '茶园观光、制茶工坊、茶艺表演、民宿体验',
+                'tips': '春季采茶季最热闹；可购买正宗六堡茶作为伴手礼。',
+                'advice': '注意防晒；尊重茶农劳动成果。'
+            },
+            '荷美覃塘景区': {
+                'address': '广西贵港市覃塘区',
+                'intro': '万亩荷花盛开，清香扑鼻，是赏荷、摄影、休闲的好地方。',
+                'ticket': '免费开放（部分项目收费）',
+                'open_time': '08:00-18:00',
+                'features': '荷花观赏、栈道漫步、摄影基地、农家乐',
+                'tips': '6-7月为盛花期；建议清晨或傍晚前往光线柔和。',
+                'advice': '注意防蚊虫；勿采摘荷花；保护生态环境。'
+            },
+            '藤县石表山休闲旅游景区': {
+                'address': '广西梧州市藤县',
+                'intro': '以丹霞地貌和溪流峡谷为主，是户外探险和休闲度假的好去处。',
+                'ticket': '成人票约60元，学生票半价',
+                'open_time': '08:00-17:30',
+                'features': '峡谷漂流、观景台、溶洞、民族歌舞表演',
+                'tips': '建议乘船游览；夏季水位高更适合漂流。',
+                'advice': '穿救生衣；注意防晒防蚊；保护生态环境。'
+            },
+            '虞山公园': {
+                'address': '广西桂林市叠彩区',
+                'intro': '桂林市区内著名公园，以虞山命名，风景秀丽，是市民休闲胜地。',
+                'ticket': '免费开放',
+                'open_time': '06:00-22:00',
+                'features': '虞山、湖景、亭台楼阁、儿童乐园、健身广场',
+                'tips': '适合晨练和傍晚散步；可登虞山俯瞰市区。',
+                'advice': '注意安全；勿攀爬未开放区域。'
+            },
+            '西溪森林温泉度假邨': {
+                'address': '广西贺州市八步区',
+                'intro': '森林环绕的温泉度假区，水质富含矿物质，适合养生放松。',
+                'ticket': '成人票约150元，住宿含温泉更划算',
+                'open_time': '09:00-22:00',
+                'features': '露天泡池、私汤房、SPA中心、森林氧吧',
+                'tips': '建议泡汤前先淋浴；饭后一小时再入池。',
+                'advice': '高血压、心脏病患者慎泡；携带泳衣毛巾。'
+            },
+            '谢鲁山庄': {
+                'address': '广西玉林市陆川县',
+                'intro': '岭南四大名园之一，始建于1920年，融合园林、建筑、文化于一体。',
+                'ticket': '成人票约50元，学生票半价',
+                'open_time': '08:30-17:30',
+                'features': '古典园林、亭台楼阁、假山流水、文化展馆',
+                'tips': '适合拍照、写生；可体验茶艺表演。',
+                'advice': '注意地面湿滑；保持安静。'
+            },
+            '贺州园博园': {
+                'address': '广西贺州市八步区',
+                'intro': '集园林艺术、生态环保、休闲娱乐于一体的综合性园区。',
+                'ticket': '免费开放',
+                'open_time': '08:00-18:00',
+                'features': '各市展园、湖景、儿童乐园、科普馆、夜景灯光',
+                'tips': '适合亲子游；可结合西溪温泉一同游览。',
+                'advice': '园区较大，穿舒适鞋；注意防晒。'
+            },
+            '通灵大峡谷': {
+                'address': '广西百色市靖西市',
+                'intro': '集峡谷、瀑布、溶洞、原始森林于一体，是“地球绿色之心”。',
+                'ticket': '成人票约110元，学生票半价',
+                'open_time': '08:00-17:30',
+                'features': '通灵瀑布、地下河、溶洞、观景台、栈道',
+                'tips': '建议预留半天游览；雨季水量大，景色更壮观。',
+                'advice': '穿防滑鞋；注意安全警示；勿独自深入未开发区域。'
+            },
+            '邕州阁': {
+                'address': '广西南宁市青秀区邕江畔',
+                'intro': '南宁新地标，仿古塔楼，登顶可俯瞰邕江和城市全景。',
+                'ticket': '登阁约30元，外围免费',
+                'open_time': '09:00-21:00',
+                'features': '观景台、文化展览、夜景灯光、江景步道',
+                'tips': '夜晚灯光秀最美；可结合民生广场、亭子码头游览。',
+                'advice': '塔内楼梯较陡，注意安全；登塔前可先拍照留念。'
+            },
+            '金秀圣堂湖景区': {
+                'address': '广西来宾市金秀瑶族自治县',
+                'intro': '高山湖泊，湖水清澈，四周群山环绕，是瑶族文化和自然风光结合地。',
+                'ticket': '免费开放（部分项目收费）',
+                'open_time': '08:00-18:00',
+                'features': '湖光山色、观景台、瑶族文化展、皮划艇、露营',
+                'tips': '清晨或傍晚光线最佳；可体验瑶族歌舞、长桌宴。',
+                'advice': '山路崎岖，建议自驾或包车；带防寒衣物。'
+            },
+            '钦州老街': {
+                'address': '广西钦州市钦南区',
+                'intro': '百年骑楼老街，保留南洋风格建筑，是钦州历史文化的缩影。',
+                'ticket': '免费开放',
+                'open_time': '全天开放',
+                'features': '骑楼建筑、老字号商铺、海鲜排档、文化展馆',
+                'tips': '适合拍照、品尝海鲜；可结合三娘湾景区游览。',
+                'advice': '注意地面湿滑；尊重当地居民生活习惯。'
+            },
+            '静兰水上运动中心': {
+                'address': '广西柳州市鱼峰区',
+                'intro': '专业水上运动基地，提供帆船、皮划艇、桨板等项目。',
+                'ticket': '按项目收费（约80-200元/人）',
+                'open_time': '09:00-18:00',
+                'features': '水上运动、培训课程、观景平台、休闲餐饮',
+                'tips': '建议提前预约；初学者可参加体验课。',
+                'advice': '穿救生衣；注意防晒防蚊；听从教练指导。'
+            },
+            '骆越文化宫': {
+                'address': '广西南宁市青秀区',
+                'intro': '展示骆越文化起源与发展，是了解广西本土民族历史的重要场所。',
+                'ticket': '免费开放',
+                'open_time': '09:00-17:00',
+                'features': '文化展馆、文物展、多媒体演示、互动体验',
+                'tips': '适合亲子研学；可结合南宁孔庙游览。',
+                'advice': '保持安静；禁止饮食、触摸展品。'
+            },
+            '鱼鳞坝': {
+                'address': '广西桂林市灵川县',
+                'intro': '因河床布满鱼鳞状石块得名，水流清澈，是网红打卡和戏水胜地。',
+                'ticket': '免费开放',
+                'open_time': '全天开放',
+                'features': '鱼鳞石、浅滩戏水、摄影基地、农家乐',
+                'tips': '夏季适合玩水；建议清晨或傍晚前往光线柔和。',
+                'advice': '注意湿滑；勿在深水区玩耍；保护环境勿乱扔垃圾。'
+            },
+            '鹅泉': {
+                'address': '广西百色市靖西市',
+                'intro': '中国西南三大名泉之一，泉水清澈见底，四周田园风光如画。',
+                'ticket': '成人票约60元，学生票半价',
+                'open_time': '08:00-18:00',
+                'features': '泉水景观、古桥、田园风光、摄影基地',
+                'tips': '清晨或傍晚光线最佳；可体验竹筏漂流。',
+                'advice': '注意安全；勿在泉中游泳；保护水质。'
+            },
+            '鹿峰山风景区': {
+                'address': '广西玉林市兴业县',
+                'intro': '以溶洞和山景为主，洞内钟乳石千姿百态，是休闲旅游好去处。',
+                'ticket': '成人票约60元，学生票半价',
+                'open_time': '08:00-17:30',
+                'features': '溶洞群、观景台、登山步道、文化展馆',
+                'tips': '洞内恒温，建议穿外套；可结合鹿峰寺游览。',
+                'advice': '注意安全警示；勿攀爬未开放区域。'
+            },
+            '黄姚古镇景区': {
+                'address': '广西贺州市昭平县',
+                'intro': '千年古镇，保存完好明清建筑，青石板街、小桥流水，古韵悠长。',
+                'ticket': '成人票约80元，学生票半价',
+                'open_time': '08:00-18:00',
+                'features': '古街巷、宗祠、石板桥、豆豉作坊、油茶店',
+                'tips': '适合慢游，品尝当地豆制品和油茶；可租电动车代步。',
+                'advice': '雨季路面湿滑；部分店铺下午关门较早。'
+            },
+            '龙脊梯田': {
+                'address': '广西桂林市龙胜各族自治县',
+                'intro': '世界梯田之冠，层层叠叠，春灌秋收时节尤为壮观。',
+                'ticket': '成人票约80元，学生票半价',
+                'open_time': '08:00-18:00',
+                'features': '梯田观景台、瑶族村寨、农耕体验、星空摄影',
+                'tips': '4-5月灌水期、9-10月收割期最美；建议清晨前往。',
+                'advice': '山路崎岖，建议自驾或包车；带防滑鞋。'
+            },
+            '龙门群岛（七十二泾）': {
+                'address': '广西钦州市钦南区',
+                'intro': '由72个岛屿组成，海水清澈，是海上观光和休闲度假的好去处。',
+                'ticket': '游船票约120元，学生票半价',
+                'open_time': '08:30-17:30',
+                'features': '海岛风光、游船观光、海鲜排档、观景台',
+                'tips': '建议乘船游览；可结合三娘湾景区一同游玩。',
+                'advice': '注意防晒防蚊；穿防滑鞋；保护海洋环境。'
+            },
+            '龟岭谷生态旅游景区': {
+                'address': '广西南宁市宾阳县',
+                'intro': '以龟形山岭和生态农业为主，集观光、休闲、康养于一体。',
+                'ticket': '免费开放（部分项目收费）',
+                'open_time': '08:00-18:00',
+                'features': '龟岭观景、生态农场、亲子乐园、露营区',
+                'tips': '适合亲子游；可体验采摘、烧烤、垂钓。',
+                'advice': '注意安全；带防蚊液；保护生态环境。'
+            }
+        }
+        return spot_data.get(spot_name, {
+            'address': '-', 'intro': '-', 'ticket': '-',
+            'open_time': '-', 'features': '-', 'tips': '-', 'advice': '-'
+        })
+
+    def load_example_image(self, example_num):
+        example_paths = {1: 'example1.jpg', 2: 'example2.jpg'}
+        if example_num in example_paths:
+            self.current_image_path = example_paths[example_num]
+            self.image_label.setText(f"示例{example_num}（请确保文件存在于当前目录）")
+            self.upload_btn.setText(f"✅ 示例{example_num}已加载")
+            self.upload_btn.setStyleSheet("""
+                QPushButton {
+                    font-size: 12px;
+                    color: #2ecc71;
+                    border: none;
+                    background-color: transparent;
+                    margin-top: 10px;
+                    font-weight: bold;
+                }
+            """)
+            self.recognize_btn.setEnabled(True)
+            # 🔥 加载示例图片时也启用重新上传按钮
+            self.reupload_btn.setEnabled(True)
+            self.clear_result()
+        else:
+            QMessageBox.warning(self, '提示', '示例图片不存在')
+
+    def clear_result(self):
+        try:
+            self.景区名称_content.clear()
+            self.详细地址_content.clear()
+            self.景点介绍_content.clear()
+            self.门票信息_content.clear()
+            self.开放时间_content.clear()
+            self.特色景点_content.clear()
+            self.推荐游玩提示_content.clear()
+            self.实用小贴士_content.clear()
+            self.status_label.setText("识别结果 置信度: 0.0%")
+        except:
+            pass
+
+    def closeEvent(self, event):
+        reply = QMessageBox.question(
+            self, '退出', '确定要退出吗？', QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply == QMessageBox.Yes:
+            event.accept()
+        else:
+            event.ignore()
+
+
+def main():
+    import os
+    os.environ['CUDA_VISIBLE_DEVICES'] = '-1'
+    sys.stdout.reconfigure(encoding='utf-8')
+    sys.stderr.reconfigure(encoding='utf-8')
+
+    QApplication.setAttribute(Qt.AA_EnableHighDpiScaling)
+    QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps)
+
+    app = QApplication(sys.argv)
+    app.setStyle('Fusion')
+    app.setFont(QFont('Microsoft YaHei', 10))
+
+    window = SpotRecognitionApp()
+    window.show()
+    sys.exit(app.exec_())
+
+
+if __name__ == '__main__':
+    main()
